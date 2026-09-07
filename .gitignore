@@ -7,3 +7,4 @@ state/
 logs/
 reports/
 .pytest_cache/
+.DS_Store
