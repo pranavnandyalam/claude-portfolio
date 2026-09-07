@@ -1,0 +1,78 @@
+# Claude-supervised systematic portfolio. Deterministic rules; Claude may only adjust
+# sleeve allocations / vol_target within `adapt` bounds (see portfolio/config.py).
+name: claude-portfolio
+mode: paper                 # 'live' additionally requires PORTFOLIO_ALLOW_LIVE=1 + state/LIVE_CONFIRMED
+cash_symbol: BIL            # 1-3 month T-bill ETF = risk-off asset
+benchmark: SPY
+data_start: "2003-01-01"
+vol_target: 0.10            # annualized; de-risk only (never levers up)
+vol_window: 63
+
+sleeves:
+  # Core: multi-asset momentum rotation with trend filter (Adaptive Asset Allocation family).
+  # Backtest 2008-2026 @10bps: CAGR ~10%, Sharpe ~0.84, MaxDD ~-16% (see docs/EVIDENCE.md).
+  - name: rotation
+    type: rotation
+    allocation: 0.50
+    params:
+      universe: [SPY, QQQ, IWM, EFA, EEM, VNQ, TLT, IEF, GLD, DBC]
+      top_n: 4
+      horizons: [63, 126, 252]
+      sma_days: 200
+      cash: BIL
+      vol_window: 63
+      inverse_vol: true
+      require_positive_momentum: true
+
+  # Diversifier: Faber GTAA-5 trend following (equal weight, gold variant). Lowest drawdowns.
+  - name: trend
+    type: trend
+    allocation: 0.30
+    params:
+      assets: [SPY, EFA, IEF, VNQ, GLD]
+      sma_days: 200
+      cash: BIL
+
+  # Equity anchor: Antonacci dual momentum (GEM).
+  - name: gem
+    type: gem
+    allocation: 0.20
+    params:
+      us: SPY
+      intl: VEU
+      bonds: AGG
+      tbill: BIL
+      lookback_days: 252
+
+risk:
+  max_position_weight: 0.45     # a single ETF (SPY can appear in all three sleeves)
+  max_gross_exposure: 1.0
+  max_daily_loss_pct: 0.03
+  warn_drawdown_pct: 0.10
+  max_drawdown_pct: 0.15        # circuit breaker → all to BIL + kill switch (human reset)
+  max_turnover_pct: 0.30        # bug-catcher for NON-rebalance days (rebalance days may turn over fully)
+  max_stale_bdays: 3
+  max_abs_daily_return: 0.50
+  min_equity_usd: 1000
+  max_symbols: 20
+
+rebalance:
+  drift_band_abs: 0.02            # on the monthly rebalance day
+  mid_period_drift_band: 0.05     # other days: only correct large drift
+  min_trade_usd: 25
+  cash_buffer_pct: 0.01
+  sell_proceeds_haircut: 0.005
+  max_turnover_pct: 1.0
+
+adapt:                            # what a scheduled Claude session may change on its own
+  sleeve_allocation_min: 0.10
+  sleeve_allocation_max: 0.60
+  max_allocation_change_per_week: 0.10
+  vol_target_min: 0.06
+  vol_target_max: 0.14
+
+schedule:
+  rebalance_freq: M               # signals are monthly; the engine runs daily but drift bands keep it quiet
+  trade_time_local: "10:05"
+  report_time_local: "16:20"
+  weekly_review_day: SUN

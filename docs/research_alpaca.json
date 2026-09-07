@@ -1,0 +1,171 @@
+{
+ "findings": [
+  {
+   "claim": "TradingClient(api_key, secret_key, paper=True) targets https://paper-api.alpaca.markets/v2; paper=False targets https://api.alpaca.markets. The SDK has NO env-var fallback: TradingClient() with no args raises ValueError('You must supply a method of authentication'), so keys must be read from env by your code and passed explicitly. Auth headers sent are APCA-API-KEY-ID / APCA-API-SECRET-KEY.",
+   "evidence": ".venv/lib/python3.12/site-packages/alpaca/trading/client.py lines 53-88 (base_url = BaseURL.TRADING_PAPER if paper else BaseURL.TRADING_LIVE; sandbox=paper); alpaca/common/rest.py _validate_credentials and _get_auth_headers; grep for 'environ' in the package returns nothing. Verified by running TradingClient() -> ValueError.",
+   "confidence": "high",
+   "source": "installed alpaca-py 0.44.0 source"
+  },
+  {
+   "claim": "Paper vs live detection: authoritative signal is the client's base URL (client._base_url == BaseURL.TRADING_PAPER); secondary signal is TradeAccount.account_number, which starts with 'PA' for paper accounts (e.g. PA39TI9AF7CO). Paper keys are separate from live keys and are not interchangeable; generate/regenerate paper keys from the paper dashboard (https://app.alpaca.markets/paper/dashboard/overview -> API Keys panel). Creating a new paper account requires generating new keys.",
+   "evidence": "docs authentication page: 'you cannot use your live account's credentials with the paper API, or vice versa'; paper-trading page: 'Your paper trading account will have a different API key from your live account' and 'Don't forget to generate new API keys for any newly created account'; PA prefix from alpaca.markets/learn/connect-to-alpaca-api search result.",
+   "confidence": "high",
+   "source": "https://docs.alpaca.markets/us/docs/authentication , https://docs.alpaca.markets/us/docs/paper-trading , https://alpaca.markets/learn/connect-to-alpaca-api"
+  },
+  {
+   "claim": "Exact 401 behavior (measured today with throwaway dummy keys): paper-api and api.alpaca.markets return HTTP 401 with body {\"message\": \"unauthorized.\"} (NO 'code' key), and data.alpaca.markets returns an nginx HTML page for 401. Therefore APIError.code raises KeyError and APIError.message raises JSONDecodeError on these; classify errors by APIError.status_code only. 401 == bad/rotated/wrong-environment keys; the current MCP 401s mean the keys in ~/.claude.json are invalid and must be regenerated.",
+   "evidence": "curl to https://paper-api.alpaca.markets/v2/account with dummy keys -> HTTP 401 {\"message\": \"unauthorized.\"}; data.alpaca.markets/v2/stocks/bars -> HTML '401 Authorization Required' nginx; alpaca/common/exceptions.py APIError.code does json.loads(self._error)['code'].",
+   "confidence": "high",
+   "source": "empirical curl probes 2026-09-07 + alpaca/common/exceptions.py"
+  },
+  {
+   "claim": "Other HTTP error meanings on the Trading API: 403 = 'Buying power or shares is not sufficient' (also account restricted / not fractionable / subscription issues), 422 = 'Input parameters are not recognized' (e.g. notional with time_in_force!=day, qty+notional together, extended_hours on a market order, asset not fractionable -> 'requested asset is not fractionable'), 404 = position/order does not exist, 429 = rate limit. The SDK auto-retries 429 and 504 up to 3 times with a fixed 3-second sleep (DEFAULT_RETRY_ATTEMPTS=3, DEFAULT_RETRY_WAIT_SECONDS=3, DEFAULT_RETRY_EXCEPTION_CODES=[429,504]) before raising APIError.",
+   "evidence": "POST /v2/orders reference: 403 'Buying power or shares is not sufficient.', 422 'Input parameters are not recognized.'; fractional-trading page: rejection message 'requested asset is not fractionable.'; alpaca/common/constants.py and rest.py _request retry loop.",
+   "confidence": "high",
+   "source": "https://docs.alpaca.markets/reference/postorder , https://docs.alpaca.markets/docs/fractional-trading , alpaca/common/rest.py"
+  },
+  {
+   "claim": "Rate limits: Trading API is 200 requests/minute per API key, identical for api.alpaca.markets and paper-api.alpaca.markets; exceeding returns 429. Market Data API: Basic (free) plan 200 req/min, Algo Trader Plus ($99/mo) 10,000 req/min. Basic websocket limit 30 symbols. Alpaca's official rate-limit doc page currently only covers the Broker API (X-RateLimit-Limit/Remaining/Reset headers); those headers were NOT present on the paper-api 401 response I probed, so do not rely on them for the Trading API.",
+   "evidence": "Alpaca support article 'usage-limit-api-calls' + forum thread 'increase the 200/min api call limit for the trading endpoint'; about-market-data-api page: Basic '200 / min', Algo Trader Plus '10,000 / min', '30 symbols'; curl -D on paper-api showed only X-Request-ID.",
+   "confidence": "medium",
+   "source": "https://alpaca.markets/support/usage-limit-api-calls , https://docs.alpaca.markets/docs/about-market-data-api , https://docs.alpaca.markets/us/docs/broker-api-rate-limits"
+  },
+  {
+   "claim": "Fractional/notional order rules (2026): per the Orders page TIF table, fractional orders (USD) are accepted ONLY with time_in_force=day (market, limit, stop, stop_limit all 'Yes' under DAY; GTC/IOC/FOK/OPG/CLS all 'No'). Notional orders are more restricted: 'Can only work for market order types and day for time in force'. qty and notional are mutually exclusive (SDK raises ValidationError if both set). Both accept up to 9 decimal places; minimum is $1 notional. Notional orders cannot be replaced (PATCH rejected). Fractional short sales are not supported ('All fractional sell orders are marked long'). Fractional trading is enabled by default on paper and live. Note a stale sentence on the 'About Trading API' page still says 'We only allow market orders for fractional trading' \u2014 using market+day for everything satisfies every version of the docs.",
+   "evidence": "Parsed 'Fractional orders (USD)' table from https://docs.alpaca.markets/us/docs/orders-at-alpaca: 'GTC | No | No | No | No' / 'DAY | Yes | Yes | Yes | Yes' / IOC,FOK,OPG,CLS all No; POST /orders reference notional description; fractional-trading page quotes; SDK OrderRequest.root_validator 'Both qty and notional can not be set.' (verified by running it).",
+   "confidence": "high",
+   "source": "https://docs.alpaca.markets/us/docs/orders-at-alpaca , https://docs.alpaca.markets/reference/postorder , https://docs.alpaca.markets/docs/fractional-trading"
+  },
+  {
+   "claim": "The SDK does NOT enforce the TIF=day rule for notional/fractional orders client-side: MarketOrderRequest(symbol='AAPL', notional=5, side=BUY, time_in_force=GTC) serializes fine and the API rejects it with 422. v0.44.0 added client-side validation only for price fields (limit_price/stop_price/trail_*: unsupported fields on a market order now raise ValueError \u2014 a documented breaking change in PR #691). Your engine must hard-code TimeInForce.DAY for all fractional/notional orders.",
+   "evidence": "Ran MarketOrderRequest(... notional=5, time_in_force=GTC).to_request_fields() -> succeeded; alpaca-py v0.44.0 release notes: 'fix(trading): validate order price requirements client-side - Breaking Change (#691)'; requests.py _raise_for_unsupported_price_fields.",
+   "confidence": "high",
+   "source": "installed SDK + https://github.com/alpacahq/alpaca-py/releases/tag/v0.44.0"
+  },
+  {
+   "claim": "client_order_id: optional, auto-generated if omitted, max 128 characters, must be unique per account. Retrieve with TradingClient.get_order_by_client_id(client_id) which calls GET /v2/orders:by_client_order_id?client_order_id=... (returns Order; 404 APIError if none). Idempotent submission pattern = deterministic id per (run_date, symbol, side) + lookup-before-submit.",
+   "evidence": "POST /orders reference: 'A unique identifier for the order. Automatically generated if not sent. (<= 128 characters)'; trading/client.py get_order_by_client_id source: params={'client_order_id': client_id}; self.get('/orders:by_client_order_id', params).",
+   "confidence": "high",
+   "source": "https://docs.alpaca.markets/reference/postorder + alpaca/trading/client.py"
+  },
+  {
+   "claim": "Order status polling: get_order_by_id(order_id) returns Order with .status (OrderStatus enum). Terminal states: filled, canceled, expired, rejected, done_for_day (and replaced). Transient: new, accepted, pending_new, partially_filled, pending_cancel, pending_replace, held, accepted_for_bidding, calculated, stopped, suspended. cancel_order_by_id(id) returns None (DELETE /v2/orders/{id}); cancel_orders() returns List[CancelOrderResponse]. get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN|CLOSED|ALL, limit<=500 (default 50), after/until datetime, symbols=[...])). Order.filled_qty / filled_avg_price / notional come back as strings.",
+   "evidence": "trading/enums.py OrderStatus; orders page Order Lifecycle table; trading/client.py cancel_order_by_id / get_orders; trading/models.py Order fields.",
+   "confidence": "high",
+   "source": "installed SDK + https://docs.alpaca.markets/us/docs/orders-at-alpaca"
+  },
+  {
+   "claim": "Positions: get_all_positions() -> List[Position] (qty, avg_entry_price, market_value, unrealized_pl as strings); get_open_position(symbol) raises APIError 404 if none; close_position(symbol, ClosePositionRequest(qty=... | percentage=...)) issues DELETE /v2/positions/{symbol} and returns the liquidating market Order (exactly one of qty/percentage; both strings); close_all_positions(cancel_orders=True) -> List[ClosePositionResponse] with per-symbol status/order_id/body. Kill switch = cancel_orders() then close_all_positions(cancel_orders=True).",
+   "evidence": "trading/client.py lines 235-325; trading/requests.py ClosePositionRequest validator; models.py ClosePositionResponse.",
+   "confidence": "high",
+   "source": "installed alpaca-py 0.44.0 source"
+  },
+  {
+   "claim": "Portfolio history: get_portfolio_history(GetPortfolioHistoryRequest(period='1M'|'3M'|'1A'..., timeframe='1D'|'15Min'|..., intraday_reporting, pnl_reset, start/end, date_end, extended_hours, cashflow_types)) -> PortfolioHistory with parallel lists timestamp (epoch seconds, left-labelled), equity, profit_loss, profit_loss_pct (Optional floats), base_value, timeframe, cashflow dict. Clock: get_clock() -> Clock(timestamp, is_open, next_open, next_close) tz-aware datetimes. Calendar: get_calendar(GetCalendarRequest(start=date, end=date)) -> List[Calendar(date, open, close)] where open/close are NAIVE Eastern-time datetimes built from 'YYYY-MM-DD HH:MM' (early closes show 13:00).",
+   "evidence": "trading/requests.py GetPortfolioHistoryRequest/GetCalendarRequest; trading/models.py PortfolioHistory, Clock, Calendar.__init__ (datetime.strptime(date+' '+open, '%Y-%m-%d %H:%M')).",
+   "confidence": "high",
+   "source": "installed alpaca-py 0.44.0 source"
+  },
+  {
+   "claim": "Account model (TradeAccount): id, account_number, status (AccountStatus, 'ACTIVE' is the go state), currency, buying_power, regt_buying_power, non_marginable_buying_power, cash, portfolio_value, equity, last_equity, multiplier, shorting_enabled, trading_blocked, account_blocked, trade_suspended_by_user, pattern_day_trader/daytrade_count/daytrading_buying_power (all Optional, now None). Preflight gate should require status=='ACTIVE' and not (trading_blocked or account_blocked or trade_suspended_by_user).",
+   "evidence": "trading/models.py TradeAccount lines ~528-561; GET /v2/account reference: 'trading_blocked: If true, the account is not allowed to place orders', 'trade_suspended_by_user: User setting. If true, the account is not allowed to place orders'.",
+   "confidence": "high",
+   "source": "installed SDK + https://docs.alpaca.markets/reference/getaccount-1"
+  },
+  {
+   "claim": "PDT rules no longer exist (major 2026 change): FINRA retired the Pattern Day Trader rule; Alpaca implemented its Intraday Margin Framework on 2026-06-04 and removed PDT/DTBP fields from API responses on 2026-07-06 (sandbox/paper deprecation started 2026-06-22). Removed from Trading API: daytrade_count, daytrading_buying_power, pattern_day_trader, last_daytrade_count, last_daytrading_buying_power on the account; dtbp_check and pdt_check on account configurations; PDT status/removal endpoints. No 3-trades-in-5-days limit and no $25k minimum; 'clients will no longer encounter trade rejections stemming from PDT protection and restrictions'. Risk is now measured by Intraday Margin Level / Intraday Margin Deficit; an IMD triggers a margin call (de minimis: < $1,000 or 5% equity). Migration guidance: replace those fields with buying_power. alpaca-py >= 0.43.5 tolerates the missing fields (PR #686); 0.44.0 marks them Optional/None.",
+   "evidence": "Changelog 'Pattern day trading and DTBP fields and endpoints are deprecated' (removal 2026-07-06); Alpaca X post: 'implementing the new Intraday Margin Framework on June 4, 2026'; docs the-intraday-margin-rule-1 and understanding-the-new-intraday-margin-rule quotes; alpaca-py PR #686 body ('removing ... on 2026-07-06 ... already started deprecating in sandbox starting today 2026-06-22'); models.py docstrings 'Deprecated; removed from Alpaca responses on 2026-07-06'.",
+   "confidence": "high",
+   "source": "https://docs.alpaca.markets/us/changelog/2026-06-03-pdt-651df23 , https://docs.alpaca.markets/us/docs/the-intraday-margin-rule-1 , https://github.com/alpacahq/alpaca-py/pull/686"
+  },
+  {
+   "claim": "Extended hours: sessions are Overnight 8:00pm-4:00am ET (Sun-Fri), Pre-market 4:00am-9:30am, Regular 9:30am-4:00pm, After-hours 4:00pm-8:00pm. An order is extended-hours eligible ONLY if extended_hours=true AND type=limit AND time_in_force in {day, gtc}; anything else is rejected. Market orders (and therefore all notional orders) cannot run in extended hours. A regular market order submitted while the market is closed is queued and executes at the next session open ('Orders not designated for extended hours execution will be queued for the next trading session'). Fractional trading works in extended/overnight sessions (limit only). Outside market hours, Alpaca rejects a second sell (notional or qty) on the same symbol while a closing order is open: 'unable to open new notional orders while having open closing position orders'.",
+   "evidence": "orders-at-alpaca Extended Hours section (full text parsed); 24/5 trading for Trading API page; POST /orders extended_hours description 'Only works with type limit and time_in_force set to either day or gtc'.",
+   "confidence": "high",
+   "source": "https://docs.alpaca.markets/us/docs/orders-at-alpaca , https://docs.alpaca.markets/us/docs/245-trading-for-trading-api"
+  },
+  {
+   "claim": "Market data feeds via StockHistoricalDataClient(api_key, secret_key) (always https://data.alpaca.markets, same keys as trading) + get_stock_bars(StockBarsRequest(symbol_or_symbols, timeframe=TimeFrame.Day, start, end, limit (max 10,000 total data points across symbols; SDK auto-paginates via next_page_token), adjustment=Adjustment.RAW|SPLIT|DIVIDEND|ALL (default raw), feed=DataFeed.IEX|SIP|DELAYED_SIP|OTC|BOATS|OVERNIGHT, asof, sort)) -> BarSet; .df gives a MultiIndex (symbol, timestamp UTC) DataFrame with open/high/low/close/volume/trade_count/vwap. Tz-aware start/end are converted to naive UTC. Basic (free) plan: IEX is 'the only feed that can be used without a subscription' for real-time; SIP historical is allowed but 'the end parameter must be at least 15 minutes old to query SIP data without a subscription', else error 'subscription does not permit querying recent SIP data'. When feed is omitted the server picks the 'best' feed for your subscription (i.e. SIP for subscribers \u2014 which will hit the 15-min rule on Basic if end defaults to now). IEX volume is ~2.5% of consolidated volume, so never use IEX volume for liquidity screens.",
+   "evidence": "data/historical/stock.py get_stock_bars (page_size=10_000, _get_marketdata pagination); data/requests.py StockBarsRequest; data/enums.py DataFeed; market-data-faq quotes; historical-stock-data page: IEX 'accounts for approximately ~2.5% of the market volume' and 'This is the only feed that can be used without a subscription'; stockbars reference: limit max 10000 default 1000, 'The limit applies to the total number of data points, not per symbol!'.",
+   "confidence": "high",
+   "source": "installed SDK + https://docs.alpaca.markets/docs/market-data-faq , https://docs.alpaca.markets/reference/stockbars , https://docs.alpaca.markets/docs/historical-stock-data-1"
+  },
+  {
+   "claim": "Safest data source for daily-close signals: run the signal job after ~4:20pm ET (or next morning) and request feed=SIP with end clamped to now-15min (consolidated prices/volume, no subscription needed), with feed=IEX daily bars as a same-key fallback that never hits the subscription error, and yfinance (auto_adjust) as the offline/DRY-RUN fallback when Alpaca returns 401. Daily bars with adjustment=ALL are comparable to yfinance auto_adjust=True prices; IEX daily closes can differ slightly from the official consolidated close.",
+   "evidence": "Derived from the 15-minute SIP rule and IEX volume-coverage statements above; Adjustment enum in data/enums.py.",
+   "confidence": "medium",
+   "source": "synthesis of docs + SDK"
+  },
+  {
+   "claim": "Paper fill model: orders fill only when marketable against real-time NBBO; quantity is NOT checked against displayed liquidity; 10% of eligible fills are random partial fills; no market impact, slippage, queue position, price improvement, regulatory fees or dividends are simulated; paper accounts start at $100k and are now created/deleted (not reset) from the dashboard. Paper-only accounts get IEX real-time data only.",
+   "evidence": "paper-trading page full text (Rules and Assumptions).",
+   "confidence": "high",
+   "source": "https://docs.alpaca.markets/us/docs/paper-trading"
+  },
+  {
+   "claim": "Working, executed wrapper module exists at /private/tmp/claude-503/-Users-prn-claude-portfolio/b3c7fc34-0438-4583-b091-6a825d1c3b9f/scratchpad/alpaca_broker.py (make_clients, is_paper, classify, preflight, check_tradable, make_client_order_id, submit_notional_market, submit_qty_market, wait_for_terminal, open_orders, close_symbol, close_everything, portfolio_history_daily, trading_days, daily_bars_iex, daily_bars_sip_delayed). Test run with dummy keys: env gate, live gate, is_paper=True, preflight -> (ok=False, reason='keys_invalid'), check_tradable -> keys_invalid, submit -> APIError classified keys_invalid, min-notional ValueError, bars -> keys_invalid \u2014 i.e. the 'keys invalid' preflight path is proven against the real paper endpoint.",
+   "evidence": "Bash run output: 'preflight: False keys_invalid paper= True', 'submit w/ bad keys -> APIError keys_invalid', 'bars w/ bad keys -> APIError keys_invalid'.",
+   "confidence": "high",
+   "source": "local execution 2026-09-07"
+  }
+ ],
+ "recommendations": [
+  "Construct clients from env in one place: TradingClient(api_key=os.environ['ALPACA_API_KEY'], secret_key=os.environ['ALPACA_SECRET_KEY'], paper=True) and StockHistoricalDataClient(same keys). Gate paper=False behind an explicit env sentinel (e.g. ALPACA_LIVE_CONFIRM) AND a config flag; never derive it from a CLI default.",
+  "Preflight before every run: get_account() + get_clock(); on APIError use e.status_code (never e.code/e.message \u2014 401 bodies lack 'code' and data-API 401s are HTML) and report 'keys_invalid' on 401. Also assert account_number.startswith('PA') when paper=True, status=='ACTIVE', and not trading_blocked/account_blocked/trade_suspended_by_user. On keys_invalid fall back to DRY-RUN with yfinance data and push a notification telling the user to regenerate paper keys at https://app.alpaca.markets/paper/dashboard/overview.",
+  "All entries: MarketOrderRequest(symbol, notional=round(x,2) >= 1.00, side=BUY, time_in_force=TimeInForce.DAY, client_order_id=deterministic). All exits: qty-based (qty=position.qty, up to 9 dp) or close_position(symbol) so you never oversell a fractional position; never mix a notional sell and a qty sell on the same symbol in one session. Never set extended_hours on market/notional orders; if you must trade outside 9:30-16:00 ET use limit + day/gtc + extended_hours=True.",
+  "Idempotency: client_order_id = f'cp-{run_date}-{symbol}-{side}' (<=128 chars), call get_order_by_client_id first and skip submit if it exists (any status); persist the returned order id in state/ before doing anything else. Treat 422 on resubmission as 'already placed' after re-checking by client id.",
+  "Check get_asset(symbol) once per run per symbol: require status=='active', tradable=True, and fractionable=True for notional orders; cache the result for the day.",
+  "Poll with get_order_by_id every >=2 s until status in {filled, canceled, expired, rejected, done_for_day}; budget the 200 req/min trading-API limit (SDK retries 429 3x with 3 s sleeps; add your own jittered backoff and a per-run request counter). Day orders that don't fill by 16:00 are auto-canceled, so an unfilled market order at session end is not an error to retry blindly.",
+  "Kill switch: cancel_orders() then close_all_positions(cancel_orders=True); log each ClosePositionResponse.status/body; write a state/KILL file that the engine checks first on every run.",
+  "Signals: schedule the daily job >= 16:20 ET; fetch bars with feed=SIP, adjustment=ALL, end=now-15min (free-tier safe) and fall back to feed=IEX then yfinance. Use SIP or yfinance volume for liquidity filters \u2014 IEX volume is ~2.5% of consolidated. Use get_calendar to skip holidays/early closes (calendar open/close are naive ET times).",
+  "Reporting: get_portfolio_history(period='3M', timeframe='1D') gives equity/profit_loss/profit_loss_pct lists keyed by epoch seconds; compute Sharpe/drawdown from equity, and compare paper performance against a stated expectation with an honest note that paper fills ignore impact/slippage/fees and randomly partial-fill 10% of orders.",
+  "Drop any PDT logic from the design (daytrade_count / pattern_day_trader are gone since 2026-07-06); size risk with buying_power/cash and your own per-run turnover cap instead."
+ ],
+ "caveats": [
+  "The 200 req/min Trading API limit comes from an Alpaca support article and forum thread, not a current docs page; the only official rate-limit doc page covers the Broker API. Treat 200/min as a planning number and honor 429s.",
+  "The 'PA' paper account-number prefix is documented in Alpaca's learn article/examples rather than the API reference; the base-URL check is the authoritative paper/live signal.",
+  "Docs are internally inconsistent on fractional order types: the Orders TIF table and fractional-trading page allow market/limit/stop/stop_limit with TIF=day, while the 'About Trading API' page still says market-only. Notional orders are unambiguously market+day only. Using market+day for all fractional orders is safe under every version.",
+  "Behavior of duplicate client_order_id submissions (expected 422) and the 404 body for an unknown client id ('order not found') were not exercised live because no valid keys exist this session; the wrapper's lookup-before-submit avoids depending on either.",
+  "Paper endpoints were exercised only through the 401 path (dummy keys). Everything past auth (order acceptance, fills, close_position responses) is verified against SDK source + docs, not live calls; re-run the wrapper's smoke test once the user regenerates paper keys.",
+  "Alpaca's 2026 changelog says the Intraday Margin framework replaced PDT; the exact IML/IMD-based rejection messages are not published, so the engine should treat any 403 containing 'buying power'/'margin' as insufficient-funds and halt rather than retry.",
+  "The wrapper module lives in the session scratchpad (/private/tmp/claude-503/-Users-prn-claude-portfolio/b3c7fc34-0438-4583-b091-6a825d1c3b9f/scratchpad/alpaca_broker.py); it was not copied into /Users/prn/claude_portfolio because the task asked for usage/snippets, not a project change."
+ ],
+ "code_snippets": [
+  {
+   "purpose": "Construct paper clients from env with a hard live gate; detect paper vs live from the base URL",
+   "code": "import os\nfrom alpaca.common.enums import BaseURL\nfrom alpaca.trading.client import TradingClient\nfrom alpaca.data.historical import StockHistoricalDataClient\n\ndef make_clients(paper: bool = True):\n    key, secret = os.environ.get(\"ALPACA_API_KEY\"), os.environ.get(\"ALPACA_SECRET_KEY\")\n    if not key or not secret:\n        raise RuntimeError(\"ALPACA_API_KEY / ALPACA_SECRET_KEY not set\")\n    if not paper and os.environ.get(\"ALPACA_LIVE_CONFIRM\") != \"I_UNDERSTAND_REAL_MONEY\":\n        raise RuntimeError(\"live trading gate: refusing paper=False\")\n    trading = TradingClient(api_key=key, secret_key=secret, paper=paper)  # -> https://paper-api.alpaca.markets\n    data = StockHistoricalDataClient(api_key=key, secret_key=secret)      # -> https://data.alpaca.markets\n    return trading, data\n\ndef is_paper(trading: TradingClient) -> bool:\n    return trading._base_url == BaseURL.TRADING_PAPER   # secondary check: account_number.startswith(\"PA\")"
+  },
+  {
+   "purpose": "Error classification that survives Alpaca's non-JSON / code-less error bodies (verified: 401 body is {\"message\": \"unauthorized.\"}, data API 401 is HTML)",
+   "code": "import json\nfrom alpaca.common.exceptions import APIError\n\ndef classify(err: APIError) -> str:\n    sc, raw = err.status_code, str(err)\n    try:\n        msg = json.loads(raw).get(\"message\", \"\")\n    except Exception:\n        msg = raw[:200]\n    if sc == 401: return \"keys_invalid\"                      # bad/rotated/wrong-env keys\n    if sc == 403:\n        if \"buying power\" in msg.lower(): return \"insufficient_buying_power\"\n        if \"SIP\" in msg or \"subscription\" in msg.lower(): return \"data_subscription\"  # recent SIP on free plan\n        return \"forbidden\"\n    if sc == 404: return \"not_found\"                         # no such position/order\n    if sc == 422: return f\"unprocessable:{msg}\"              # TIF!=day on notional, qty+notional, ext-hours market...\n    if sc == 429: return \"rate_limited\"                      # 200 req/min/key; SDK already retried 3x @3s\n    return f\"http_{sc}:{msg}\""
+  },
+  {
+   "purpose": "Preflight: account + clock, reports 'keys_invalid' clearly on 401 (proven against paper-api with dummy keys)",
+   "code": "def preflight(trading):\n    paper = is_paper(trading)\n    try:\n        acct = trading.get_account()\n        clock = trading.get_clock()\n    except APIError as e:\n        return {\"ok\": False, \"reason\": classify(e), \"paper\": paper}\n    an = acct.account_number or \"\"\n    if paper and not an.startswith(\"PA\"):\n        return {\"ok\": False, \"reason\": \"paper_url_but_non_PA_account\", \"paper\": paper}\n    blocked = bool(acct.trading_blocked or acct.account_blocked or acct.trade_suspended_by_user)\n    ok = acct.status.value == \"ACTIVE\" and not blocked\n    return {\"ok\": ok, \"reason\": \"ok\" if ok else f\"account_{acct.status.value}_blocked={blocked}\", \"paper\": paper,\n            \"account\": an[:2] + \"\u2026\" + an[-3:], \"equity\": float(acct.equity), \"cash\": float(acct.cash),\n            \"buying_power\": float(acct.buying_power), \"market_open\": clock.is_open,\n            \"next_open\": clock.next_open, \"next_close\": clock.next_close}"
+  },
+  {
+   "purpose": "Fractional eligibility check via get_asset(...).fractionable",
+   "code": "def check_tradable(trading, symbol: str, need_fractional: bool):\n    a = trading.get_asset(symbol)            # APIError 404 if unknown symbol\n    if a.status.value != \"active\" or not a.tradable:\n        return False, \"asset_not_tradable\"\n    if need_fractional and not a.fractionable:\n        return False, \"asset_not_fractionable\"   # API rejects: 'requested asset is not fractionable'\n    return True, \"ok\""
+  },
+  {
+   "purpose": "Idempotent notional (dollar) market buy: TIF must be DAY, >= $1, lookup by client_order_id before submitting",
+   "code": "import hashlib\nfrom datetime import date\nfrom alpaca.trading.enums import OrderSide, TimeInForce\nfrom alpaca.trading.requests import MarketOrderRequest\n\ndef make_client_order_id(run_date: date, symbol: str, side: str, tag=\"cp\") -> str:\n    base = f\"{tag}-{run_date.isoformat()}-{symbol}-{side}\"        # <= 128 chars required\n    return base if len(base) <= 128 else base[:100] + hashlib.sha1(base.encode()).hexdigest()[:20]\n\ndef submit_notional_market(trading, symbol, side: OrderSide, notional: float, client_order_id: str):\n    notional = round(float(notional), 2)\n    if notional < 1.00:\n        raise ValueError(\"Alpaca minimum notional is $1\")\n    try:\n        return trading.get_order_by_client_id(client_order_id)   # GET /v2/orders:by_client_order_id\n    except APIError as e:\n        if e.status_code != 404:\n            raise\n    req = MarketOrderRequest(symbol=symbol, notional=notional, side=side,\n                             time_in_force=TimeInForce.DAY,        # notional => market + day ONLY (else 422)\n                             client_order_id=client_order_id)      # no extended_hours on market orders\n    return trading.submit_order(req)\n\ndef submit_qty_market(trading, symbol, side: OrderSide, qty: float, client_order_id: str):\n    qty = round(float(qty), 9)                                      # up to 9 dp; use for sells to avoid overselling\n    try:\n        return trading.get_order_by_client_id(client_order_id)\n    except APIError as e:\n        if e.status_code != 404:\n            raise\n    return trading.submit_order(MarketOrderRequest(symbol=symbol, qty=qty, side=side,\n                                                   time_in_force=TimeInForce.DAY, client_order_id=client_order_id))"
+  },
+  {
+   "purpose": "Order status polling to a terminal state, plus open/closed order queries",
+   "code": "import time\nfrom datetime import datetime\nfrom alpaca.trading.enums import OrderStatus, QueryOrderStatus\nfrom alpaca.trading.requests import GetOrdersRequest\n\nTERMINAL = {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED, OrderStatus.DONE_FOR_DAY}\n\ndef wait_for_terminal(trading, order_id, timeout_s=120, poll_s=2.0):\n    deadline = time.monotonic() + timeout_s\n    while True:\n        o = trading.get_order_by_id(order_id)          # Order: status, filled_qty, filled_avg_price (strings)\n        if o.status in TERMINAL or time.monotonic() > deadline:\n            return o\n        time.sleep(poll_s)                              # keep >= 2 s: 200 req/min/key budget\n\nopen_orders  = lambda trading: trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))\nrun_orders   = lambda trading, since_utc: trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500, after=since_utc))\n# trading.cancel_order_by_id(order_id) -> None ; trading.cancel_orders() -> List[CancelOrderResponse]"
+  },
+  {
+   "purpose": "Positions, close_position, and the kill switch",
+   "code": "from alpaca.trading.requests import ClosePositionRequest\n\npositions = trading.get_all_positions()                       # List[Position]; qty/avg_entry_price/market_value are str\n# pos = trading.get_open_position(\"AAPL\")                     # APIError 404 if no position\n\ndef close_symbol(trading, symbol, percentage: str | None = None):\n    opts = ClosePositionRequest(percentage=percentage) if percentage else None   # exactly one of qty|percentage (strings)\n    return trading.close_position(symbol, close_options=opts)  # DELETE /v2/positions/{symbol} -> liquidating market Order\n\ndef kill_switch(trading):\n    trading.cancel_orders()\n    return trading.close_all_positions(cancel_orders=True)     # List[ClosePositionResponse]: symbol, status, order_id, body"
+  },
+  {
+   "purpose": "Portfolio history, clock and calendar for reporting/scheduling",
+   "code": "from datetime import date, datetime, timezone\nfrom alpaca.trading.requests import GetPortfolioHistoryRequest, GetCalendarRequest\n\nph = trading.get_portfolio_history(GetPortfolioHistoryRequest(period=\"3M\", timeframe=\"1D\"))\nrows = [(datetime.fromtimestamp(t, tz=timezone.utc).date(), eq, pl, plpct)\n        for t, eq, pl, plpct in zip(ph.timestamp, ph.equity, ph.profit_loss, ph.profit_loss_pct)]\n\nclock = trading.get_clock()                # .is_open, .next_open, .next_close (tz-aware datetimes)\ndays = trading.get_calendar(GetCalendarRequest(start=date(2026, 9, 1), end=date(2026, 9, 30)))\n# each Calendar: .date, .open, .close -> NAIVE Eastern-time datetimes (early close => 13:00)"
+  },
+  {
+   "purpose": "Daily bars: IEX (always free) and SIP with the free-tier 15-minute clamp; adjustment=ALL matches yfinance auto_adjust",
+   "code": "from datetime import datetime, timedelta, timezone\nfrom alpaca.data.enums import Adjustment, DataFeed\nfrom alpaca.data.requests import StockBarsRequest\nfrom alpaca.data.timeframe import TimeFrame\n\ndef daily_bars(data, symbols, start: datetime, feed=DataFeed.IEX):\n    end = None\n    if feed == DataFeed.SIP:                       # Basic plan: `end` must be >= 15 min old or 403\n        end = datetime.now(timezone.utc) - timedelta(minutes=15, seconds=30)   # 'subscription does not permit querying recent SIP data'\n    req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame.Day, start=start, end=end,\n                           adjustment=Adjustment.ALL, feed=feed, limit=10_000)  # limit = total points across symbols; SDK paginates\n    return data.get_stock_bars(req).df             # MultiIndex (symbol, timestamp UTC): open high low close volume trade_count vwap\n\n# IEX volume is ~2.5% of consolidated -> never use it for liquidity filters; use SIP (clamped) or yfinance."
+  }
+ ]
+}
